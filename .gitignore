@@ -1,0 +1,10 @@
+# Ignore Python virtual environments
+venv/
+__pycache__/
+*.pyc
+
+# Ignore SQLite databases (optional, if dynamically generated)
+*.db
+
+# Ignore environment config
+.env

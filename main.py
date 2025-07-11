@@ -1,5 +1,5 @@
 from telebot import TeleBot, types
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta
 import sqlite3
 from datetime import time
 import threading
@@ -8,12 +8,16 @@ from keepalive import keep_alive
 import pytz
 import datetime
 from PIL import Image, ImageDraw, ImageFont
-   
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # Replace 'YOUR_TELEGRAM_BOT_TOKEN' with the token you obtained from BotFather
 bot = TeleBot(os.getenv('tg_key'))
+print("Token loaded:", os.getenv("tg_key"))
 
 # Set the timezone to Nicosia, Cyprus (GMT+3)
-tz = pytz.timezone('Asia/Nicosia') 
+tz = pytz.timezone('Asia/Singapore') 
  
 #Call keep_alive function to connect to the flask server
 keep_alive()
@@ -95,13 +99,13 @@ def generate_date_selection_buttons():
     current_time = dt.now()
 
     # Create an InlineKeyboardMarkup to hold the buttons
-    markup = telebot.types.InlineKeyboardMarkup()
+    markup = types.InlineKeyboardMarkup()
 
     # Generate buttons for the next 7 days
     for i in range(7):
         date = current_time + timedelta(days=i)
         # Create an InlineKeyboardButton with the date as the callback_data
-        button = telebot.types.InlineKeyboardButton(text=date.strftime('%b %d'), callback_data=date.strftime('%Y-%m-%d'))
+        button = types.InlineKeyboardButton(text=date.strftime('%b %d'), callback_data=date.strftime('%Y-%m-%d'))
         markup.add(button)
 
     return markup
