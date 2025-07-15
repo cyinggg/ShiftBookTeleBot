@@ -1,4 +1,4 @@
-# This is a modified version of a reservation Telegram bot.
+This is a modified version of a reservation Telegram bot, credit gives to the creator.
 
 # ShiftBookTeleBot
 
