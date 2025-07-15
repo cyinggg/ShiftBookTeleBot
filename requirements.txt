@@ -1,1 +1,6 @@
-telebot == 0.0.5
+#telebot == 0.0.5
+pyTelegramBotAPI==4.14.1
+python-dotenv==1.0.1
+Pillow==10.2.0
+pytz==2024.1
+Flask==3.0.3

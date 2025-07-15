@@ -1,430 +1,516 @@
-from telebot import TeleBot, types
-from datetime import datetime as dt, timedelta
-import sqlite3
-from datetime import time
-import threading
+# Standard Library Imports
 import os
-from keepalive import keep_alive
-import pytz
-import datetime
-from PIL import Image, ImageDraw, ImageFont
-from dotenv import load_dotenv
+import sqlite3
+from datetime import datetime, timedelta, time
+from collections import defaultdict
+import threading
 
+# Third-party Imports
+from telebot import TeleBot, types  # Telegram Bot API wrapper
+from PIL import Image, ImageDraw, ImageFont  # For image confirmation
+import pytz  # Timezone support
+from dotenv import load_dotenv  # Load Telegram token from .env
+
+# Local Hosting (Replit Keep-Alive)
+from keepalive import keep_alive  # Used for Replit + UptimeRobot hosting
+
+# ========== SETUP & INITIALIZATION ========== #
+
+# Load environment variables from .env file (e.g. your bot token)
 load_dotenv()
 
-# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with the token you obtained from BotFather
+# Initialize the Telegram bot with the token stored in .env
 bot = TeleBot(os.getenv('tg_key'))
-print("Token loaded:", os.getenv("tg_key"))
 
-# Set the timezone to Nicosia, Cyprus (GMT+3)
-tz = pytz.timezone('Asia/Singapore') 
- 
-#Call keep_alive function to connect to the flask server
+# Print confirmation in the console
+print("Bot token loaded successfully.")
+
+# Set timezone to Singapore
+tz = pytz.timezone('Asia/Singapore')
+
+# Start the Flask keep-alive server (for Replit/UptimeRobot)
 keep_alive()
 
-# Create thread-local storage for SQLite connection
-local_storage = threading.local()
+# Thread-local storage to handle database access safely
+thread_local = threading.local()
 
-#Stores all user's reservations
+# Store session data per user (e.g. name, student ID, current booking)
+user_sessions = defaultdict(dict)
+
+# Store temporary available slots per user for inline handling
 available_time_slots = {}
 
+# ============================
+# DATABASE CONNECTION & SETUP
+# ============================
 
-def get_db_connection():
-    # Check if a connection exists for the current thread, if not, create a new one
-    if not hasattr(local_storage, 'db'):
-        local_storage.db = sqlite3.connect('tennis_court_reservation.db')
-        create_reservations_table()  # Ensure the table is created
-    return local_storage.db
+# Connect to SQLite (thread-safe using thread-local storage)
+def get_db():
+    if not hasattr(thread_local, 'conn'):
+        conn = sqlite3.connect('shiftbooktelebot.db', check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        thread_local.conn = conn
+    return thread_local.conn
 
+# Create necessary tables if they don't exist
+def create_tables():
+    conn = get_db()
+    cursor = conn.cursor()
 
-def create_reservations_table():
-    db_connection = get_db_connection()
-    cursor = db_connection.cursor()
+    # Students table (student_id, name, is_restricted)
     cursor.execute('''
-        CREATE TABLE IF NOT EXISTS reservations (
-            user_id INTEGER PRIMARY KEY,
-            reservation_time TEXT
-        );
+        CREATE TABLE IF NOT EXISTS students (
+            student_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_restricted INTEGER DEFAULT 0
+        )
     ''')
-    db_connection.commit()
- 
 
-def save_reservation_to_db(user_id, reservation_time): 
-    cursor = get_db_connection().cursor()
-    cursor.execute("INSERT INTO reservations (user_id, reservation_time) VALUES (?, ?)", (user_id, reservation_time))
-    get_db_connection().commit()
+    # Bookings table (id, student_id, shift_date, shift_type, booked_at)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT,
+            shift_date TEXT,
+            shift_type TEXT,
+            booked_at TEXT
+        )
+    ''')
 
+    conn.commit()
 
-def delete_reservation_from_db(user_id):
-    cursor = get_db_connection().cursor()
-    cursor.execute("DELETE FROM reservations WHERE user_id=?", (user_id,))
-    get_db_connection().commit()
+# Call this once when the bot starts to ensure tables exist
+create_tables()
 
+# ============================
+# BOOKING & LOGIN UTILITIES
+# ============================
 
-def generate_reservation_image(first_name, last_name, date, time):
-    # Create a blank white image
-    image = Image.new('RGB', (800, 400), color='white')
+# Validate student login credentials
+def validate_student(student_id, name):
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM students WHERE student_id = ? AND name = ?", (student_id, name))
+    return cursor.fetchone()
 
-    # Create an ImageDraw object to draw on the image
-    draw = ImageDraw.Draw(image)
+# Insert new shift booking into the database
+def insert_booking(student_id, shift_date, shift_type):
+    conn = get_db()
+    cursor = conn.cursor()
+    booked_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute('''
+        INSERT INTO bookings (student_id, shift_date, shift_type, booked_at)
+        VALUES (?, ?, ?, ?)
+    ''', (student_id, shift_date, shift_type, booked_at))
+    conn.commit()
 
-    # Load the Arial font with size 20
-    font = ImageFont.truetype("arial", size=20)
+# Get count of bookings in the week of `shift_date`
+def get_weekly_booking_count(student_id, shift_date):
+    conn = get_db()
+    cursor = conn.cursor()
+    start_of_week = shift_date - timedelta(days=shift_date.weekday())  # Monday
+    end_of_week = start_of_week + timedelta(days=6)  # Sunday
+    cursor.execute('''
+        SELECT COUNT(*) FROM bookings
+        WHERE student_id = ? AND shift_date BETWEEN ? AND ?
+    ''', (student_id, start_of_week.isoformat(), end_of_week.isoformat()))
+    return cursor.fetchone()[0]
 
-    # Define the texts
-    texts = [f"Name: {first_name} {last_name}", f"Date: {date}", f"Time: {time}"]
+# Get count of bookings in the month of `shift_date`
+def get_monthly_booking_count(student_id, shift_date):
+    conn = get_db()
+    cursor = conn.cursor()
+    month_start = shift_date.replace(day=1)
+    next_month = (month_start + timedelta(days=32)).replace(day=1)
+    month_end = next_month - timedelta(days=1)
+    cursor.execute('''
+        SELECT COUNT(*) FROM bookings
+        WHERE student_id = ? AND shift_date BETWEEN ? AND ?
+    ''', (student_id, month_start.isoformat(), month_end.isoformat()))
+    return cursor.fetchone()[0]
 
-    # Calculate total text height
-    total_text_height = sum(draw.textsize(text, font=font)[1] for text in texts)
+# Return True if user can still book shifts on this date (4/week, 10/month unless within 5 days)
+def check_shift_limits(student_id, shift_date):
+    today = datetime.now(tz).date()
+    five_day_limit = today + timedelta(days=5)
 
-    # Start the y_offset in the middle of the image minus half of the total text height
-    y_offset = (image.height - total_text_height) // 2
+    if shift_date <= five_day_limit:
+        return True  # Exempted if booking within next 5 days
 
-    # Draw each line of text
-    for text in texts:
-        text_width, text_height = draw.textsize(text, font=font)
-        x_position = (image.width - text_width) // 2
-        draw.text((x_position, y_offset), text, font=font, fill='black')
-        y_offset += text_height + 10  # add some space between lines
+    weekly = get_weekly_booking_count(student_id, shift_date)
+    monthly = get_monthly_booking_count(student_id, shift_date)
 
-    # Save the image to a file (optional)
-    image_path = f"{first_name}_{last_name}_{date}_{time}.png"
-    image.save(image_path)
+    return weekly < 4 and monthly < 10
 
-    return image, image_path
-
-
-def generate_date_selection_buttons():
-    # Get the current date and time
-    current_time = dt.now()
-
-    # Create an InlineKeyboardMarkup to hold the buttons
-    markup = types.InlineKeyboardMarkup()
-
-    # Generate buttons for the next 7 days
-    for i in range(7):
-        date = current_time + timedelta(days=i)
-        # Create an InlineKeyboardButton with the date as the callback_data
-        button = types.InlineKeyboardButton(text=date.strftime('%b %d'), callback_data=date.strftime('%Y-%m-%d'))
-        markup.add(button)
-
-    return markup
-
-
-def generate_available_time_slots(date):
-    # Set the timezone for Cyprus
-    tz = pytz.timezone('Europe/Nicosia')
-
-    # Create a time object for the start of the day
-    start_of_day = time(0, 0)
-
-    # Convert the provided date to a timezone-aware datetime object at the start of the day
-    aware_date_start = tz.localize(dt.combine(date, start_of_day))
-
-    # Get the already reserved slots for the date
-    reserved_slots = get_reserved_time_slots(date)
-
-    # Generate list of available time slots for the selected date
-    available_slots = [
-        aware_date_start + timedelta(hours=h)
-        for h in range(6, 22) # 6 AM to 10 PM
-        if (aware_date_start + timedelta(hours=h)).strftime('%H:%M') not in reserved_slots
-    ]
-
-    return available_slots
-
-
-def get_reserved_time_slots(date):
-    cursor = get_db_connection().cursor()
-    cursor.execute("SELECT reservation_time FROM reservations WHERE strftime('%Y-%m-%d', reservation_time) = ?", (date.strftime('%Y-%m-%d'),))
-    reserved_times = cursor.fetchall()
-    reserved_slots = [datetime.strptime(time[0], '%Y-%m-%d %H:%M').strftime('%H:%M') for time in reserved_times]
-    return reserved_slots
-
-
-def send_confirmation(chat_id, reservation_datetime, message, user_info):
-    # Get the user information
-    user_info = get_user_info(chat_id)
-    user_id = message.from_user.id
-    first_name = user_info['first_name']
-    last_name = user_info.get('last_name', '')
-
-    # Generate the reservation details text
-    reservation_details = (
-        f"Name: {first_name} {last_name}\n"
-        f"Date: {reservation_datetime.strftime('%Y-%m-%d')}\n"
-        f"Time: {reservation_datetime.strftime('%H:%M')}"
-    )
-    # Create an image to hold the text
-    image = Image.new('RGB', (300, 150), color='white')
-    draw = ImageDraw.Draw(image)
-
-    # Select font and size (you might need to specify the path to a font file) 
-    font_path = "arial.ttf"  # Path to your font file
-    font = ImageFont.truetype(font_path, size=20)
-
-    # Draw the text onto the image 
-    draw.text((10, 10), reservation_details, fill="black", font=font)
-
-    # Save the image to a temporary file
-    image_path = 'reservation.png'
-    image.save(image_path)
-
-    # Send the image to the user
-    with open(image_path, 'rb') as photo:
-        bot.send_photo(chat_id, photo, caption="Congratulations! You have successfully reserved the tennis court!")
-
-    # Remove the temporary image file
-    os.remove(image_path)
-    new_reservation = (user_id, reservation_datetime)
-    # Get all the user's reservations and save them to the file
-    save_reservation_to_file(new_reservation, 'reservations.txt') 
-
-    start_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    start_button = types.KeyboardButton('/start')
-    reserve_button = types.KeyboardButton('/reserve')
-    cancel_button = types.KeyboardButton('/cancel')
-    support_button = types.KeyboardButton('/support')
-    location_button = types.KeyboardButton('/location')
-
-    start_markup.add(start_button, reserve_button, cancel_button, support_button, location_button)
-    bot.send_message(message.chat.id, "Choose the function:", reply_markup=start_markup)
-
-
-def save_reservation_to_file(reservation, file_path):
-    user_id, reservation_time = reservation
-    
-    # Check if the reservation_time is a datetime object
-    if isinstance(reservation_time, datetime):
-        reservation_time_formatted = reservation_time.strftime("%Y-%m-%d %H:%M")
-    else:
-        reservation_time_formatted = reservation_time # You may need to adapt this line to fit your specific case
-
-    user_info = get_user_info(user_id)
-    first_name = user_info['first_name']
-    last_name = user_info.get('last_name', '')
-    reservation_info = f"User ID: {user_id}, Name: {first_name} {last_name}, Reservation Date and Time: {reservation_time_formatted}\n"
-
-    with open(file_path, 'a') as file:
-        file.write(reservation_info)
-
-
-
-def get_all_reservations():
-    db_connection = get_db_connection()
-    cursor = db_connection.cursor()
-    cursor.execute("SELECT user_id, reservation_time FROM reservations")
-    return cursor.fetchall()
-
-
-def get_user_info(user_id):
-    try:
-        user = bot.get_chat(user_id)
-        return {
-            'id': user.id,
-            'first_name': user.first_name,
-            'last_name': user.last_name
-        }
-    except Exception as e:
-        print(f"Failed to get user information for user_id {user_id}: {e}")
-        return {}
-
+# ============================
+# /start Login Flow
+# ============================
 
 @bot.message_handler(commands=['start'])
-def send_welcome(message):
-    start_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    start_button = types.KeyboardButton('/start')
-    reserve_button = types.KeyboardButton('/reserve')
-    cancel_button = types.KeyboardButton('/cancel')
-    support_button = types.KeyboardButton('/support')
-    location_button = types.KeyboardButton('/location')
+def handle_start(message):
+    chat_id = message.chat.id
+    user_sessions[chat_id] = {}  # Reset session
 
-    start_markup.add(start_button, reserve_button, cancel_button, support_button, location_button)
-    bot.send_message(message.chat.id, "Welcome to the Tennis Court Reservation Bot!\n\nUse /start to start again.\n\nUse /reserve to book a court for 1 hour.\n\nUse /cancel to cancel your reservation.\n\nUse /support to text the support team.\n\nUse /location to get the court location.")
-    bot.send_message(message.chat.id, "Choose the function:", reply_markup=start_markup)
+    bot.send_message(chat_id, "👋 Welcome to the Student Shift Booking Bot!\nPlease enter your **Student ID**:")
+    bot.register_next_step_handler(message, handle_student_id)
+
+def handle_student_id(message):
+    chat_id = message.chat.id
+    student_id = message.text.strip()
+    user_sessions[chat_id]['student_id'] = student_id
+
+    bot.send_message(chat_id, "✅ Now enter your **Full Name** (case-sensitive):")
+    bot.register_next_step_handler(message, lambda msg: validate_user(msg, student_id))
+
+def validate_user(message, student_id):
+    chat_id = message.chat.id
+    name = message.text.strip()
+
+    student = validate_student(student_id, name)
+
+    if student:
+        user_sessions[chat_id]['name'] = name
+        user_sessions[chat_id]['is_restricted'] = bool(student['is_restricted'])
+        user_sessions[chat_id]['pending_bookings'] = []
+
+        bot.send_message(chat_id, f"✅ Login successful! Welcome, *{name}*.", parse_mode='Markdown')
+        main_menu = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        main_menu.add("/reserve", "/cancel", "/support", "/location")
+        bot.send_message(chat_id, "📍 Use the menu below to proceed:", reply_markup=main_menu)
+
+        bot.send_message(chat_id, "📅 Enter the date you want to check for shifts (format: YYYY-MM-DD):")
+        bot.register_next_step_handler(message, handle_date_selection)
+    else:
+        bot.send_message(chat_id, "❌ Invalid Student ID or Name. Please try /start again.")
+
+# ============================
+# Shift Selection Flow
+# ============================
+
+def handle_date_selection(message):
+    chat_id = message.chat.id
+    date_str = message.text.strip()
+
+    try:
+        shift_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        bot.send_message(chat_id, "⚠ Invalid date format. Please use YYYY-MM-DD.")
+        return
+
+    user_sessions[chat_id]['current_date'] = shift_date
+
+    # Load existing bookings from DB
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT shift_type FROM bookings
+        WHERE shift_date = ?
+    """, (date_str,))
+    taken = [row['shift_type'] for row in cursor.fetchall()]
+    conn.close()
+
+    # All possible shifts
+    all_shifts = ['morning', 'afternoon1', 'afternoon2', 'afternoon3']
+
+    # Allow night shifts only if user is *not* restricted
+    if not user_sessions[chat_id].get('is_restricted'):
+        all_shifts += ['night1', 'night2']
+
+    # Filter out taken shifts
+    available_shifts = [s for s in all_shifts if s not in taken]
+
+    if not available_shifts:
+        bot.send_message(chat_id, f"❌ No available shifts on {date_str}. Please choose another date.")
+        return
+
+    user_sessions[chat_id]['available_shifts'] = available_shifts
+
+    # Build reply markup for shift selection
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for s in available_shifts:
+        markup.add(s)
+    markup.add("🔙 Back to Date", "✅ Proceed to Confirm")
+
+    bot.send_message(chat_id, f"🗓 Available shifts on {date_str}:\n\n" +
+                     "\n".join(f"• {s}" for s in available_shifts),
+                     reply_markup=markup)
+    bot.register_next_step_handler(message, handle_shift_selection)
+
+def handle_shift_selection(message):
+    chat_id = message.chat.id
+    text = message.text.strip().lower()
+    session = user_sessions.get(chat_id, {})
+
+    if text == "🔙 back to date":
+        bot.send_message(chat_id, "🔁 Enter new date (YYYY-MM-DD):")
+        bot.register_next_step_handler(message, handle_date_selection)
+        return
+    elif text == "✅ proceed to confirm":
+        show_booking_summary(chat_id, message)
+        return
+
+    shift_type = text
+    shift_date = session.get('current_date')
+
+    # Validate shift selection
+    if shift_type not in session.get('available_shifts', []):
+        bot.send_message(chat_id, "⚠ Invalid shift selection. Please choose from the list.")
+        return
+
+    # Restriction: only 1 shift per day for restricted users (either afternoon or night)
+    if session.get('is_restricted'):
+        already = [b for b in session.get('pending_bookings', []) if b['date'] == shift_date]
+        if already:
+            bot.send_message(chat_id, "⚠ You can only book *one shift per day* (afternoon or night).", parse_mode='Markdown')
+            return
+
+    # Check shift limits (4/week, 10/month unless within 5 days)
+    student_id = session.get('student_id')
+    if not check_shift_limits(student_id, shift_date):
+        bot.send_message(chat_id, "⚠ You’ve reached your shift limit for the week/month. Only bookings within the next 5 days are allowed.")
+        return
+
+    # Add this selection to session (pending)
+    session.setdefault('pending_bookings', []).append({'date': shift_date, 'shift': shift_type})
+    bot.send_message(chat_id, f"✅ Saved: {shift_type} on {shift_date}. You may add more shifts or proceed to confirm.")
+    bot.register_next_step_handler(message, handle_shift_selection)
+
+# ============================
+# Booking Summary + Confirm
+# ============================
+
+def show_booking_summary(chat_id, message):
+    bookings = user_sessions[chat_id].get('pending_bookings', [])
+    if not bookings:
+        bot.send_message(chat_id, "⚠ You haven’t selected any shifts yet.")
+        return
+
+    summary = "\n".join([f"• {b['shift']} on {b['date']}" for b in bookings])
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("✅ Confirm All", "❌ Cancel All")
+
+    bot.send_message(chat_id,
+                     f"📝 Your pending bookings:\n\n{summary}\n\nWould you like to confirm?",
+                     reply_markup=markup)
+    bot.register_next_step_handler(message, handle_confirmation)
+
+def handle_confirmation(message):
+    chat_id = message.chat.id
+    text = message.text.strip()
+    session = user_sessions.get(chat_id, {})
+    student_id = session.get("student_id")
+    bookings = session.get("pending_bookings", [])
+
+    if text == "✅ Confirm All":
+        conn = get_db()
+        cursor = conn.cursor()
+
+        now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        for booking in bookings:
+            cursor.execute("""
+                INSERT INTO bookings (student_id, shift_date, shift_type, booked_at)
+                VALUES (?, ?, ?, ?)
+            """, (student_id, booking['date'].isoformat(), booking['shift'], now_str))
+        conn.commit()
+        conn.close()
+
+        summary = "\n".join([f"• {b['shift']} on {b['date']}" for b in bookings])
+        bot.send_message(chat_id, f"✅ Your shifts have been booked:\n\n{summary}")
+        user_sessions.pop(chat_id, None)  # Clear session after confirmation
+
+    elif text == "❌ Cancel All":
+        bot.send_message(chat_id, "❌ All pending bookings have been discarded.")
+        session['pending_bookings'] = []
+
+    else:
+        bot.send_message(chat_id, "⚠ Invalid option. Please choose Confirm All or Cancel All.")
+        show_booking_summary(chat_id, message)
+
+# ============================
+# Shift Limit Checks
+# (4 per week, 10 per month)
+# ============================
+
+def check_shift_limits(student_id, shift_date):
+    today = datetime.now(tz).date()
+    within_5_days = (shift_date - today).days <= 5
+    if within_5_days:
+        return True  # allow override
+
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # Weekly limit
+    start_of_week = shift_date - timedelta(days=shift_date.weekday())
+    end_of_week = start_of_week + timedelta(days=6)
+    cursor.execute("""
+        SELECT COUNT(*) FROM bookings
+        WHERE student_id = ? AND shift_date BETWEEN ? AND ?
+    """, (student_id, start_of_week.isoformat(), end_of_week.isoformat()))
+    weekly_count = cursor.fetchone()[0]
+
+    # Monthly limit
+    month_start = shift_date.replace(day=1)
+    next_month = shift_date.replace(day=28) + timedelta(days=4)
+    month_end = (next_month - timedelta(days=next_month.day)).date()
+    cursor.execute("""
+        SELECT COUNT(*) FROM bookings
+        WHERE student_id = ? AND shift_date BETWEEN ? AND ?
+    """, (student_id, month_start.isoformat(), month_end.isoformat()))
+    monthly_count = cursor.fetchone()[0]
+
+    conn.close()
+    return weekly_count < 4 and monthly_count < 10
+
+# ============================
+# /reserve Command
+# Shortcut to restart booking
+# ============================
+
+@bot.message_handler(commands=['reserve'])
+def handle_reserve(message):
+    chat_id = message.chat.id
+    user_sessions[chat_id] = {}  # clear previous session
+    bot.send_message(chat_id, "📋 Starting new reservation...\nEnter your Student ID:")
+    bot.register_next_step_handler(message, handle_student_id)
+
+# ============================
+# /cancel Command
+# Remove ALL future bookings
+# ============================
+
+@bot.message_handler(commands=['cancel'])
+def handle_cancel(message):
+    chat_id = message.chat.id
+    session = user_sessions.get(chat_id, {})
+
+    student_id = session.get("student_id")
+    if not student_id:
+        bot.send_message(chat_id, "❌ You are not logged in. Please /start to login.")
+        return
+
+    today = datetime.now(tz).date()
+
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM bookings
+        WHERE student_id = ? AND shift_date >= ?
+    """, (student_id, today.isoformat()))
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted:
+        bot.send_message(chat_id, f"✅ All your *future* bookings have been cancelled.", parse_mode="Markdown")
+    else:
+        bot.send_message(chat_id, "⚠ You don’t have any future bookings to cancel.")
+
+# --------------------------------------------
+# Show booking summary & prompt to confirm
+# --------------------------------------------
+def show_summary(chat_id, message):
+    bookings = user_sessions[chat_id].get('pending_bookings', [])
+    if not bookings:
+        bot.send_message(chat_id, "⚠ You haven't selected any shifts yet.")
+        return
+
+    # Create a summary of selected shifts
+    summary = "\n".join([f"• {b['shift']} on {b['date']}" for b in bookings])
+
+    # Create confirmation buttons
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("Confirm All", "Cancel All")
+
+    bot.send_message(
+        chat_id,
+        f"📝 *Your pending bookings:*\n\n{summary}\n\nDo you want to confirm?",
+        parse_mode="Markdown",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(message, handle_confirmation)
+
+# ----------------------------------------------------
+# Final confirmation handler (insert into database)
+# ----------------------------------------------------
+def handle_confirmation(message):
+    chat_id = message.chat.id
+    user_input = message.text.strip()
+    session = user_sessions.get(chat_id, {})
+    student_id = session.get("student_id")
+    bookings = session.get("pending_bookings", [])
+
+    if user_input == "Confirm All":
+        if not bookings:
+            bot.send_message(chat_id, "⚠ No bookings to confirm.")
+            return
+
+        # Open DB connection
+        conn = get_db()
+        cursor = conn.cursor()
+        now_str = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Insert each confirmed booking
+        for booking in bookings:
+            cursor.execute("""
+                INSERT INTO bookings (student_id, shift_date, shift_type, booked_at)
+                VALUES (?, ?, ?, ?)
+            """, (student_id, booking['date'].isoformat(), booking['shift'], now_str))
+
+        conn.commit()
+        conn.close()
+
+        # Confirmation message
+        summary = "\n".join([f"• {b['shift']} on {b['date']}" for b in bookings])
+        bot.send_message(chat_id, f"✅ *Your shifts have been booked successfully!*\n\n{summary}", parse_mode="Markdown")
+
+        # Clear session
+        user_sessions.pop(chat_id, None)
+
+    elif user_input == "Cancel All":
+        # Clear selections without saving
+        user_sessions[chat_id]['pending_bookings'] = []
+        bot.send_message(chat_id, "❌ All pending bookings have been cancelled.")
+
+    else:
+        # Retry prompt
+        bot.send_message(chat_id, "Please choose *Confirm All* or *Cancel All*.", parse_mode="Markdown")
+        show_summary(chat_id, message)
+
+# --- Location Configuration (Backend editable) ---
+# Default location (can be edited in backend)
+DEFAULT_LOCATION = "ProjectHub E2 Level 4"
+
+@bot.message_handler(commands=['location'])
+def handle_location(message):
+    bot.send_message(message.chat.id, f"📍 Project Location:\n{DEFAULT_LOCATION}")
 
 
 @bot.message_handler(commands=['support'])
-def on_start_command(message):
-    # Send a message with the inline keyboard
+def handle_support(message):
     markup = types.InlineKeyboardMarkup()
-    btn = types.InlineKeyboardButton("Text support", url='https://t.me/ImMrAlex')
-    markup.add(btn)
+    markup.row_width = 1
+    markup.add(
+        types.InlineKeyboardButton("🚨 Emergency Laboratory Safety", callback_data="support_emergency"),
+        types.InlineKeyboardButton("🩺 First Aider", callback_data="support_firstaider"),
+        types.InlineKeyboardButton("🏥 A&E Unit", callback_data="support_ae"),
+        types.InlineKeyboardButton("👩 Admin Support", callback_data="support_admin"),
+    )
+    bot.send_message(message.chat.id, "Please select a support type:", reply_markup=markup)
 
-    bot.send_message(message.chat.id, "Press the button to text the support team.", reply_markup=markup)
-    start_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    start_button = types.KeyboardButton('/start')
-    reserve_button = types.KeyboardButton('/reserve')
-    cancel_button = types.KeyboardButton('/cancel')
-    support_button = types.KeyboardButton('/support')
-    location_button = types.KeyboardButton('/location')
+@bot.callback_query_handler(func=lambda call: call.data.startswith("support_"))
+def handle_support_callback(call):
+    support_info = {
+        "support_emergency": "🚨 *Emergency Laboratory Safety*\nCall: 9114 8724",
+        "support_firstaider": "🩺 *First Aiders Available:*\n- Mr. Francis Ng: 6592 1251\n- Mr. Darryl Lim: 6592 5049",
+        "support_ae": "🏥 *Nearest A&E Unit*\nSengkang General Hospital\n110 Sengkang East Way S544886\nContact: 6930 5000",
+        "support_admin": "👩 *Admin Support*\nContact Ying: 9370 9168"
+    }
 
-    start_markup.add(start_button, reserve_button, cancel_button, support_button, location_button)
-    bot.send_message(message.chat.id, "Choose the function:", reply_markup=start_markup)
+    if call.data in support_info:
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, support_info[call.data], parse_mode='Markdown')
 
-
-@bot.message_handler(commands=['location'])
-def send_location(message):
-    # Replace these coordinates with the latitude and longitude of the location you want to send
-    latitude = 34.70197266790477
-    longitude = 33.07582804045963
-
-    bot.send_location(message.chat.id, latitude, longitude)
-    bot.send_message(message.chat.id, 'Court is near Sklavenitis Columbia Parking, behind Sklavenitis Columbia, Germasogeia Limassol')
-    start_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    start_button = types.KeyboardButton('/start')
-    reserve_button = types.KeyboardButton('/reserve')
-    cancel_button = types.KeyboardButton('/cancel')
-    support_button = types.KeyboardButton('/support')
-    location_button = types.KeyboardButton('/location')
-
-    start_markup.add(start_button, reserve_button, cancel_button, support_button, location_button)
-    bot.send_message(message.chat.id, "Choose the function:", reply_markup=start_markup)
-
-
-@bot.message_handler(commands=['reserve'])
-def ask_for_date(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    cursor = get_db_connection().cursor()
-    cursor.execute("SELECT reservation_time FROM reservations WHERE user_id=?", (user_id,))
-    reservation_time = cursor.fetchone()
-
-    if reservation_time:  # Check if reservation_time is not None
-        reservation_time_naive = dt.strptime(reservation_time[0], '%Y-%m-%d %H:%M')
-        reservation_time_aware = tz.localize(reservation_time_naive)
-
-        if reservation_time_aware > dt.now(tz):
-            bot.send_message(chat_id, "You already have a reservation on {}. You can't make a new reservation until this one is past.".format(reservation_time[0]))
-            return
-        else:
-            # Delete previous reservation if it already happened
-            delete_reservation_from_db(user_id)
-
-    # Generate buttons for date selection
-    markup = generate_date_selection_buttons()
-    bot.send_message(chat_id, "Please select the date you want to play:", reply_markup=markup)
-
-
-@bot.message_handler(commands=['cancel'])
-def cancel(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    cursor = get_db_connection().cursor()
-    cursor.execute("SELECT reservation_time FROM reservations WHERE user_id=?", (user_id,))
-    reservation_time = cursor.fetchone()
-
-    if reservation_time:
-        # Extract the reservation date
-        reservation_date = dt.strptime(reservation_time[0], '%Y-%m-%d %H:%M').date()
-
-        # Delete the reservation
-        delete_reservation_from_db(user_id)
-
-        # Regenerate available time slots for the reservation date
-        generate_available_time_slots(reservation_date)
-
-        bot.send_message(chat_id, "Your reservation has been canceled.")
-        new_reservation = (user_id, reservation_time[0] + ", canceled")
-        save_reservation_to_file(new_reservation, 'reservations.txt')
-    else:
-        bot.send_message(chat_id, "You don't have any reservation to cancel.")
-
-      
-@bot.callback_query_handler(func=lambda call: True)
-def process_date_selection(call):
-    chat_id = call.message.chat.id
-    user_id = call.from_user.id
-    selected_date = call.data
-
-    # Get the selected date as a datetime object
-    reservation_date = dt.strptime(selected_date, '%Y-%m-%d').date()
-
-    # Check if the selected date is within the next 7 days
-    current_time = dt.now().date()
-    next_7_days = current_time + timedelta(days=7)
-
-    if current_time <= reservation_date <= next_7_days:
-        # Generate list of available time slots for the selected date
-        available_slots = generate_available_time_slots(reservation_date)
-
-        if not available_slots:
-            bot.send_message(chat_id, "Sorry, no available time slots for {}.".format(reservation_date.strftime('%Y-%m-%d')))
-        else:
-            # Save the available time slots to the dictionary for the user
-            available_time_slots[user_id] = {'date': reservation_date, 'slots': available_slots}
-
-            # Generate buttons for time selection
-            markup = generate_time_selection_buttons(available_slots)
-            bot.send_message(chat_id, "Available time slots for {}:".format(reservation_date.strftime('%Y-%m-%d')), reply_markup=markup)
-
-    else:
-        bot.send_message(chat_id, "Sorry, you can only reserve a time within the next 7 days.")
-
-
-def generate_time_selection_buttons(available_slots):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-    current_datetime = dt.now(tz)  # Replace datetime.datetime with dt
-
-    # Generate buttons for each available time slot within the specified range (6 AM to 10 PM)
-    for slot in available_slots:
-        # Check if the slot is within the range and is not in the past or within the next 5 minutes (buffer time)
-        if 6 <= slot.hour < 22 and slot >= current_datetime + timedelta(minutes=5):  # Replace datetime.timedelta with timedelta
-            button = types.KeyboardButton(slot.strftime('%H:%M'))
-            markup.add(button)
-
-    return markup
-
-
-@bot.message_handler(func=lambda message: message.text and message.text in [slot.strftime('%H:%M') for slot in available_time_slots.get(message.from_user.id, {}).get('slots', [])])
-def process_time_selection(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    selected_time = message.text.strip()
-
-    # Get the selected date from the available_time_slots dictionary
-    selected_date = available_time_slots[user_id]['date']
-
-    # Parse the selected time input
-    selected_time_obj = dt.strptime(selected_time, '%H:%M').time()
-
-    # Combine the selected date and reservation time to create the reservation datetime
-    reservation_datetime = dt.combine(selected_date, selected_time_obj)
-
-    # Add timezone information to the reservation datetime
-    reservation_datetime = tz.localize(reservation_datetime)
-
-    # Check if the reservation time is in the past
-    if reservation_datetime < dt.now(tz):
-        bot.send_message(chat_id, "You cannot reserve a time in the past.")
-    else:
-        # Save the reservation to the database
-        save_reservation_to_db(user_id, reservation_datetime.strftime('%Y-%m-%d %H:%M'))
-
-        # Send confirmation message to the user
-        user_info = get_user_info(user_id)
-        send_confirmation(chat_id, reservation_datetime, message, user_info)
-
-        # Remove the selected time from available slots for the user
-        available_time_slots[user_id]['slots'] = [slot for slot in available_time_slots[user_id]['slots'] if slot.strftime('%H:%M') != selected_time]
-        available_time_slots[user_id]['slots'] = [slot for slot in available_time_slots[user_id]['slots'] if slot.astimezone(tz) > dt.now(tz)]  # Remove past slots
-
-
-@bot.message_handler(content_types=['text'])
-def handle_text(message):
-    start_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    start_button = types.KeyboardButton('/start')
-    reserve_button = types.KeyboardButton('/reserve')
-    cancel_button = types.KeyboardButton('/cancel')
-    support_button = types.KeyboardButton('/support')
-    location_button = types.KeyboardButton('/location')
-
-    start_markup.add(start_button, reserve_button, cancel_button, support_button, location_button)
-    text_answer_message = "Choose command to continue: "
-    bot.send_message(message.chat.id, text_answer_message, reply_markup=start_markup)
- 
-
-# Polling loop to keep the bot running with none_stop=True
-bot.polling(none_stop=True)
+if __name__ == "__main__":
+    print("Bot is polling for updates...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
